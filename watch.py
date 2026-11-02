@@ -27,7 +27,9 @@ EXTRACT_JS = r"""
     const msg = a.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"]');
     let text = msg ? msg.innerText : '';
     if (!text) {
-      text = Array.from(a.querySelectorAll('div[dir="auto"]')).map(d => d.innerText).join(' ');
+      text = Array.from(a.querySelectorAll('div[dir="auto"]'))
+        .filter(d => d.closest('[role="article"]') === a)
+        .map(d => d.innerText).join(' ');
     }
     return {
       href: link ? link.href : '',
@@ -48,10 +50,11 @@ def clean_excerpt(text, limit=140):
     return text
 
 
-def dedupe_key(post_id, author, time_text, text):
+def dedupe_key(post_id, author, text):
     if post_id:
         return "id:" + post_id
-    raw = f"{author}|{time_text}|{(text or '')[:100]}"
+    norm = " ".join((text or "").split())[:100]
+    raw = f"{author}|{norm}"
     return "h:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -79,8 +82,9 @@ def is_allowed_url(url, gids):
 
 
 def is_login_url(url):
-    u = url.lower()
-    return "login" in u or "checkpoint" in u
+    path = urlparse(url).path.lower()
+    return any(path == p or path.startswith(p + "/") or path.startswith(p + ".")
+               for p in ("/login", "/checkpoint"))
 
 
 def feed_url(url):
@@ -135,7 +139,7 @@ def read_group(page, group, gids, max_posts):
             gid, pid = parse_post_href(item["href"])
             author = " ".join(item["author"].split())
             ttext = " ".join(item["time"].split())
-            key = dedupe_key(pid, author, ttext, item["text"])
+            key = dedupe_key(pid, author, item["text"])
             if key not in posts:
                 posts[key] = {
                     "author": author, "time": ttext, "text": item["text"],
@@ -158,9 +162,12 @@ def format_post(group_name, p):
 
 
 def launch(pw, profile, headless=False):
-    return pw.chromium.launch_persistent_context(
+    ctx = pw.chromium.launch_persistent_context(
         profile, headless=headless, timezone_id="Europe/Oslo"
     )
+    ctx.set_default_timeout(60000)
+    ctx.set_default_navigation_timeout(60000)
+    return ctx
 
 
 def run_login(profile):
@@ -181,26 +188,35 @@ def run_login(profile):
 
 
 def run_watch(cfg_path, profile, db_path):
-    from playwright.sync_api import sync_playwright
     groups, max_posts = load_config(cfg_path)
     gids = {g["gid"] for g in groups}
     db = open_db(db_path)
+    try:
+        return _watch(groups, gids, max_posts, profile, db)
+    finally:
+        db.close()
+
+
+def _watch(groups, gids, max_posts, profile, db):
+    from playwright.sync_api import sync_playwright
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    lines, failed = [], 0
+    lines, alerts = [], []
     with sync_playwright() as pw:
         ctx = launch(pw, profile)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.set_default_timeout(60000)
+            page.set_default_navigation_timeout(60000)
             for g in groups:
+                err = ""
                 try:
                     posts = read_group(page, g, gids, max_posts)
                 except Abort:
                     raise
-                except Exception:
-                    posts = {}
+                except Exception as e:
+                    posts, err = {}, " " + type(e).__name__
                 if not posts:
-                    failed += 1
-                    lines.append(f"ALERT parse_error {g['name']}")
+                    alerts.append(f"ALERT parse_error {g['name']}{err}")
                     continue
                 baseline = db.execute(
                     "SELECT 1 FROM seen WHERE grp=? LIMIT 1", (g["gid"],)
@@ -216,12 +232,16 @@ def run_watch(cfg_path, profile, db_path):
             print(e.line)
             return e.code
         finally:
-            ctx.close()
+            try:
+                ctx.close()
+            except Exception:
+                pass
     db.commit()
-    db.close()
     if lines:
         print("\n\n".join(lines))
-    return 3 if groups and failed == len(groups) else 0
+    if alerts:
+        print(("\n" if lines else "") + "\n".join(alerts))
+    return 3 if alerts else 0
 
 
 def main(argv=None):
@@ -235,7 +255,8 @@ def main(argv=None):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        return 0
+        print("ALERT locked")
+        return 5
     os.makedirs(a.profile, exist_ok=True)
     if a.login:
         return run_login(a.profile)
