@@ -258,6 +258,12 @@ def main(argv=None):
         print("ALERT locked")
         return 5
     os.makedirs(a.profile, exist_ok=True)
+    # we hold the lock, so no browser of ours has the profile open
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            os.unlink(os.path.join(a.profile, name))
+        except FileNotFoundError:
+            pass
     if a.login:
         return run_login(a.profile)
     return run_watch(a.config, a.profile, a.state)
